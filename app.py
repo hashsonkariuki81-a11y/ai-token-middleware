@@ -1,6 +1,8 @@
 import os
 import re
+import threading
 import time
+from datetime import date
 from pathlib import Path
 from urllib.parse import quote
 
@@ -15,7 +17,7 @@ ASSETS = BASE_DIR / "assets"
 ICON_PATH = ASSETS / "icon.png"
 LOGO_PATH = ASSETS / "logo.png"
 
-GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"]
+GEMINI_MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-flash-latest"]
 CLAUDE_NEW_URL = "https://claude.ai/new"
 CHAT_URL_RE = re.compile(r"^https://claude\.ai/chat/[0-9a-fA-F-]{36}/?$")
 MAX_PREFILL_CHARS = 6000  # conservative: long URLs may be cut off by browsers
@@ -123,18 +125,61 @@ def explain_error(e: Exception) -> str:
     return f"Gemini API error: {msg}"
 
 
+FREE_RUNS = int(os.environ.get("FREE_RUNS_PER_SESSION", "5"))
+DAILY_CAP = int(os.environ.get("DAILY_CAP", "100"))
+MAX_FREE_CHARS = int(os.environ.get("MAX_FREE_CHARS", "40000"))
+
+
+@st.cache_resource
+def daily_counter():
+    return {"day": date.today(), "count": 0, "lock": threading.Lock()}
+
+
+def try_use_shared_run():
+    used = st.session_state.get("runs_used", 0)
+    if used >= FREE_RUNS:
+        return False, (f"You've used your {FREE_RUNS} free runs for this session. "
+                       "Paste your own Gemini key in the sidebar to continue.")
+    dc = daily_counter()
+    with dc["lock"]:
+        if dc["day"] != date.today():
+            dc["day"], dc["count"] = date.today(), 0
+        if dc["count"] >= DAILY_CAP:
+            return False, ("The shared daily limit has been reached. Try again tomorrow "
+                           "or paste your own Gemini key in the sidebar.")
+        dc["count"] += 1
+    st.session_state["runs_used"] = used + 1
+    return True, ""
+
+
+def shared_gate(nchars: int) -> bool:
+    if not using_shared:
+        return True
+    if nchars > MAX_FREE_CHARS:
+        st.error(f"Shared mode accepts up to {MAX_FREE_CHARS:,} characters per run. "
+                 "Paste your own Gemini key in the sidebar for bigger files.")
+        return False
+    ok, msg = try_use_shared_run()
+    if not ok:
+        st.error(msg)
+    return ok
+
+
 def generate_with_retry(client, model, contents, config=None):
     """Retry on temporary overload (503), then fall back to the other models."""
     order = [model] + [m for m in GEMINI_MODELS if m != model]
     last = None
     for m in order:
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 return client.models.generate_content(model=m, contents=contents, config=config)
             except Exception as e:
                 last = e
-                if "503" in str(e) or "UNAVAILABLE" in str(e):
-                    time.sleep(2 * (attempt + 1))
+                err = str(e)
+                if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                    break  # quota used up on this model: try the next one right away
+                if "503" in err or "UNAVAILABLE" in err or "timed out" in err.lower():
+                    time.sleep(1 + attempt)
                     continue
                 raise
     raise last
@@ -167,19 +212,32 @@ if app_pw and not st.session_state.get("authed"):
 
 # ---------------------------------------------------------------- sidebar
 st.sidebar.header("Configuration")
-server_key = get_default_key()
-if server_key:
-    # Key lives on the server only and is never sent to the browser.
-    api_key = server_key.strip().strip('"').strip("'")
-    st.sidebar.success("Using the server's API key")
+server_key = get_default_key().strip().strip('"').strip("'")
+own_key = (
+    st.sidebar.text_input("Use your own Gemini API key (optional)", type="password")
+    .strip()
+    .strip('"')
+    .strip("'")
+)
+runs_box = st.sidebar.empty()
+if own_key:
+    api_key, using_shared = own_key, False
+    runs_box.success("Using your own key. No limits from this app.")
+elif server_key:
+    api_key, using_shared = server_key, True
 else:
-    api_key = (
-        st.sidebar.text_input("Google Gemini API Key", type="password")
-        .strip()
-        .strip('"')
-        .strip("'")
-    )
-    st.sidebar.caption("Free key: aistudio.google.com → Get API key.")
+    api_key, using_shared = "", False
+
+
+def show_runs():
+    if using_shared:
+        left = max(0, FREE_RUNS - st.session_state.get("runs_used", 0))
+        runs_box.info(f"Free shared mode: {left} of {FREE_RUNS} runs left this session. "
+                      "Paste your own key above for unlimited use.")
+
+
+show_runs()
+st.sidebar.caption("Free key: aistudio.google.com → Get API key.")
 model_name = st.sidebar.selectbox("Gemini model", GEMINI_MODELS)
 st.sidebar.caption(
     "Free-tier inputs may be used by Google to improve its products. "
@@ -190,7 +248,7 @@ if not api_key:
     st.warning("⚠️ Add your Gemini API key in the sidebar (or in Secrets) to begin.")
     st.stop()
 
-client = genai.Client(api_key=api_key)
+client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=90000))
 
 # ---------------------------------------------------------------- step 1: input
 st.session_state.setdefault("compressed", "")
@@ -217,10 +275,13 @@ if compress_clicked:
     source = read_upload(uploaded) if uploaded else pasted
     if not source.strip():
         st.warning("Upload a file or paste some text first.")
+    elif not shared_gate(len(source)):
+        pass
     else:
         hint = f"\n\n(The user's goal, for deciding what to keep: {question.strip()})" if question.strip() else ""
         with st.spinner("Compressing with Gemini..."):
             try:
+                t0 = time.perf_counter()
                 resp = generate_with_retry(
                     client,
                     model_name,
@@ -230,6 +291,7 @@ if compress_clicked:
                         temperature=0.2,
                     ),
                 )
+                t_gen = time.perf_counter() - t0
                 out = (resp.text or "").strip()
                 if not out:
                     raise ValueError("The model returned an empty response.")
@@ -243,6 +305,7 @@ if compress_clicked:
                 st.session_state["orig_tokens"] = o_tok
                 st.session_state["new_tokens"] = n_tok
                 st.session_state.pop("gemini_answer", None)
+                st.caption(f"Gemini took {t_gen:.1f}s (model: {getattr(resp, 'model_version', model_name)}); total {time.perf_counter() - t0:.1f}s.")
             except Exception as e:
                 st.error(explain_error(e))
 
@@ -271,7 +334,7 @@ if st.session_state["compressed"]:
 
     with tab_gemini:
         st.caption("Gemini answers your question using the compressed text. Free.")
-        if st.button("Ask Gemini"):
+        if st.button("Ask Gemini") and shared_gate(0):
             package = build_package(st.session_state["compressed"], question, continuing=False)
             with st.spinner("Gemini is answering..."):
                 try:
@@ -307,3 +370,5 @@ if st.session_state["compressed"]:
 
         st.markdown("**Text to send** (use the copy icon at the top right of the box)")
         st.code(package, language="markdown")
+
+show_runs()
