@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.streamlit/secrets.toml
+app.py.bak
+test_key.py
