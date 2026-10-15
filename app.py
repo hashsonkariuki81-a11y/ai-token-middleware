@@ -196,6 +196,11 @@ def build_package(compressed: str, question: str, continuing: bool) -> str:
 
 
 def read_upload(uploaded) -> str:
+    if uploaded.name.lower().endswith(".pdf"):
+        from pypdf import PdfReader
+
+        reader = PdfReader(uploaded)
+        return "\n\n".join((page.extract_text() or "") for page in reader.pages)
     return uploaded.getvalue().decode("utf-8", errors="replace")
 
 
@@ -258,7 +263,7 @@ with left:
     st.subheader("1. Your material")
     uploaded = st.file_uploader(
         "Upload a text-based file",
-        type=["txt", "md", "log", "py", "js", "ts", "json", "csv", "html", "css", "yml", "yaml", "xml", "sql"],
+        type=["txt", "md", "log", "py", "js", "ts", "json", "csv", "html", "css", "yml", "yaml", "xml", "sql", "pdf"],
     )
     pasted = st.text_area("...or paste text here", height=220)
 with right:
@@ -274,7 +279,7 @@ compress_clicked = st.button("⚡ Compress", type="primary")
 if compress_clicked:
     source = read_upload(uploaded) if uploaded else pasted
     if not source.strip():
-        st.warning("Upload a file or paste some text first.")
+        st.warning("No text found. Upload a text-based file or paste text. Scanned PDFs (pictures of pages) have no text to extract.")
     elif not shared_gate(len(source)):
         pass
     else:
